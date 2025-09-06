@@ -10,6 +10,7 @@ val password = "password"
 
 val listenerConnection = DriverManager.getConnection(url, user, password)
 
+// for exposed database connection
 fun Application.configureDatabase() {
     Database.connect(
         url = url,

@@ -14,6 +14,11 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.postgresql.PGConnection
 import java.util.Collections
 import io.ktor.websocket.Frame
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.retry
 import kotlinx.serialization.json.contentOrNull
 
 data class ClientSubscription(
@@ -37,29 +42,38 @@ fun unsubscribeFromAllMessages(session: WebSocketSession) {
     subscriptions.removeIf { it.session == session }
 }
 
-suspend fun listenForNotifications() {
-    listenerConnection.createStatement().use { stmt ->
+fun listenForNotificationsUnsafe(pgConn: PGConnection): Flow<Pair<String, List<Message>>> = flow {
+    val sqlConn = if (pgConn is java.sql.Connection) pgConn else error("Not a SQL Connection")
+    sqlConn.createStatement().use { stmt ->
         stmt.execute("LISTEN tickets_channel;")
     }
 
-    val pgConn = listenerConnection.unwrap(PGConnection::class.java)
-
     while (true) {
-        Thread.sleep(500)
+        delay(500)
         val notifications = pgConn.notifications
-        notifications?.
-            filter { it.name == "tickets_channel" }?.
-            forEach { notification ->
+        notifications
+            ?.filter { it.name == "tickets_channel" }
+            ?.forEach { notification ->
                 val json = parseToJsonElement(notification.parameter).jsonObject
                 val destinationEmail = json["destinationEmail"]?.jsonPrimitive?.contentOrNull ?: return@forEach
 
-                // Fetch updated messages list for that ticket
                 val updatedMessages = getAllMessages(destinationEmail)
-
-                broadcastTicketsToSubscribers(destinationEmail, updatedMessages)
+                emit(destinationEmail to updatedMessages)
             }
     }
+}
 
+fun listenForNotifications(pgConn: PGConnection, maxRetries: Long = 5): Flow<Pair<String, List<Message>>> {
+    return listenForNotificationsUnsafe(pgConn)
+        .retry(retries = maxRetries) { e ->
+            Logger.getLogger("MessageListener")
+                .severe("Flow failed, retrying: ${e.message}")
+            true // retry on any exception
+        }
+        .catch { e ->
+            Logger.getLogger("MessageListener").severe("Flow failed permanently: ${e.message}")
+            throw e // propagate to let Kubernetes restart pod
+        }
 }
 
 private suspend fun broadcastTicketsToSubscribers(
@@ -82,6 +96,9 @@ private suspend fun broadcastTicketsToSubscribers(
 
 fun Application.listenToMessageNotifications() {
     launch {
-        listenForNotifications()
+        val pgConn = listenerConnection.unwrap(PGConnection::class.java)
+        listenForNotifications(pgConn).collect { (destinationEmail, updatedMessages) ->
+            broadcastTicketsToSubscribers(destinationEmail, updatedMessages)
+        }
     }
 }
