@@ -1,7 +1,7 @@
 package com.example
 
 import com.example.message.routing.configureMessageSockets
-import com.example.message.listenToMessageNotifications
+import com.example.message.listenToNotifications
 import com.example.message.routing.configureMessageRoutes
 import io.ktor.server.application.Application
 
@@ -14,6 +14,6 @@ fun Application.module() {
     configureHttp()
     configureMessageSockets()
     configureDatabase()
-    listenToMessageNotifications()
+    listenToNotifications()
     configureMessageRoutes()
 }

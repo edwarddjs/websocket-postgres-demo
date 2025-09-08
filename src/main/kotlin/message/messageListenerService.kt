@@ -8,18 +8,18 @@ import java.util.logging.Logger
 import io.ktor.websocket.WebSocketSession
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json.Default.encodeToString
-import kotlinx.serialization.json.Json.Default.parseToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.postgresql.PGConnection
 import java.util.Collections
 import io.ktor.websocket.Frame
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.retry
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.filter
+import org.postgresql.PGNotification
 
 data class ClientSubscription(
     val session: WebSocketSession,
@@ -42,38 +42,71 @@ fun unsubscribeFromAllMessages(session: WebSocketSession) {
     subscriptions.removeIf { it.session == session }
 }
 
-fun listenForNotificationsUnsafe(pgConn: PGConnection): Flow<Pair<String, List<Message>>> = flow {
-    val sqlConn = if (pgConn is java.sql.Connection) pgConn else error("Not a SQL Connection")
-    sqlConn.createStatement().use { stmt ->
-        stmt.execute("LISTEN tickets_channel;")
-    }
 
+val notificationSharedFlow = MutableSharedFlow<PGNotification>(
+    extraBufferCapacity = 100,
+    onBufferOverflow = BufferOverflow.DROP_OLDEST
+)
+
+val messageNotificationSharedFlow = MutableSharedFlow<Pair<String, List<Message>>>(
+    extraBufferCapacity = 100,
+    onBufferOverflow = BufferOverflow.DROP_OLDEST
+)
+
+// One coroutine reads from Postgres and pushes notifications into the shared flow
+suspend fun startNotificationEmitter(pgConn: PGConnection, maxRetries: Int = 5) {
+    var retries = 0
     while (true) {
-        delay(500)
-        val notifications = pgConn.notifications
-        notifications
-            ?.filter { it.name == "tickets_channel" }
-            ?.forEach { notification ->
-                val json = parseToJsonElement(notification.parameter).jsonObject
-                val destinationEmail = json["destinationEmail"]?.jsonPrimitive?.contentOrNull ?: return@forEach
-
-                val updatedMessages = getAllMessages(destinationEmail)
-                emit(destinationEmail to updatedMessages)
-            }
+        try {
+            startNotificationEmitterUnsafe(pgConn)
+        } catch (e: Exception) {
+            retries++
+            Logger.getLogger("MessageListener")
+                .severe("Emitter failed (attempt $retries): ${e.message}")
+            if (retries >= maxRetries) throw e // Let K8s restart
+            delay(5000)
+        }
     }
 }
 
-fun listenForNotifications(pgConn: PGConnection, maxRetries: Long = 5): Flow<Pair<String, List<Message>>> {
-    return listenForNotificationsUnsafe(pgConn)
-        .retry(retries = maxRetries) { e ->
-            Logger.getLogger("MessageListener")
-                .severe("Flow failed, retrying: ${e.message}")
-            true // retry on any exception
+private suspend fun startNotificationEmitterUnsafe(pgConn: PGConnection) {
+    if (pgConn !is java.sql.Connection) error("Not a SQL Connection")
+
+    pgConn.createStatement().use { stmt -> stmt.execute("LISTEN tickets_channel;") }
+    while (true) {
+        delay(500)
+        val notifications = pgConn.notifications
+        notifications?.forEach { notification ->
+
+            notificationSharedFlow.emit(notification)
         }
-        .catch { e ->
-            Logger.getLogger("MessageListener").severe("Flow failed permanently: ${e.message}")
-            throw e // propagate to let Kubernetes restart pod
+    }
+}
+
+private suspend fun startMessageNotificationEmitter() {
+    notificationSharedFlow
+        .filter { it.name == "tickets_channel" }
+        .collect { notification ->
+            val json = Json.parseToJsonElement(notification.parameter).jsonObject
+            val email = json["destinationEmail"]?.jsonPrimitive?.contentOrNull ?: return@collect
+            val messages = getAllMessages(email)
+            messageNotificationSharedFlow.emit(email to messages)
         }
+}
+
+fun Application.listenToNotifications() {
+    val pgConn = listenerConnection.unwrap(PGConnection::class.java)
+    launch {
+        startNotificationEmitter(pgConn)
+    }
+    launch {
+        startMessageNotificationEmitter()
+    }
+    launch {
+        messageNotificationSharedFlow.collect { (email, messages) ->
+            broadcastTicketsToSubscribers(email, messages)
+        }
+    }
 }
 
 private suspend fun broadcastTicketsToSubscribers(
@@ -92,13 +125,4 @@ private suspend fun broadcastTicketsToSubscribers(
         }
     }
     subscriptions.removeAll(dead)
-}
-
-fun Application.listenToMessageNotifications() {
-    launch {
-        val pgConn = listenerConnection.unwrap(PGConnection::class.java)
-        listenForNotifications(pgConn).collect { (destinationEmail, updatedMessages) ->
-            broadcastTicketsToSubscribers(destinationEmail, updatedMessages)
-        }
-    }
 }
